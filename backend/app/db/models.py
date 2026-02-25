@@ -22,6 +22,7 @@ class Job(Base):
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
+    next_run_at = Column(DateTime, nullable=True)
 
     def touch(self):
         self.updated_at = datetime.utcnow()

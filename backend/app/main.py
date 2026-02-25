@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from fastapi import Depends, HTTPException
 from app.db.database import Base, SessionLocal, engine
 from app.db.models import Job as JobModel  # noqa: E402 - register model with Base
+from datetime import timedelta
 
 Base.metadata.create_all(bind=engine)
 
@@ -26,6 +27,16 @@ class CreateJobRequest(BaseModel):
     payload: Optional[Dict[str, Any]] = None
     priority: int = Field(5, ge=1, le=10)
     max_attempts: int = Field(3, ge=1, le=10)
+
+def backoff_seconds(attempt: int) -> int:
+    # attempt is 1-based after the failure has been counted
+    if attempt == 1:
+        return 10
+    if attempt == 2:
+        return 30
+    if attempt == 3:
+        return 90
+    return 300
 
 app = FastAPI(title="SmartFlow Scheduler")
 
@@ -123,8 +134,13 @@ def start_job(job_id: str, db: Session = Depends(get_db)):
     if job.status != "queued":
         raise HTTPException(status_code=400, detail=f"Job is not queued (status={job.status})")
 
+    now = datetime.utcnow()
+    if job.next_run_at is not None and job.next_run_at > now:
+        raise HTTPException(status_code=409, detail="Job not ready to run yet")
+
     job.status = "running"
     job.started_at = datetime.utcnow()
+    job.next_run_at = None
     job.touch()
     db.commit()
 
@@ -146,3 +162,53 @@ def complete_job(job_id: str, db: Session = Depends(get_db)):
     db.commit()
 
     return {"id": job.id, "status": job.status}
+
+class FailJobRequest(BaseModel):
+    error: str = Field(..., min_length=1)
+
+@app.post("/jobs/{job_id}/fail")
+def fail_job(job_id: str, req: FailJobRequest, db: Session = Depends(get_db)):
+    job = db.query(JobModel).filter(JobModel.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # only running jobs should fail
+    if job.status != "running":
+        raise HTTPException(status_code=400, detail=f"Job is not running (status={job.status})")
+
+    job.attempts += 1
+    job.last_error = req.error
+
+    if job.attempts >= job.max_attempts:
+        job.status = "dead"
+        job.touch()
+        db.commit()
+        return {"id": job.id, "status": job.status, "attempts": job.attempts, "next_run_at": job.next_run_at}
+
+    delay = backoff_seconds(job.attempts)
+    job.status = "queued"
+    job.next_run_at = datetime.utcnow() + timedelta(seconds=delay)
+    job.touch()
+    db.commit()
+
+    return {"id": job.id, "status": job.status, "attempts": job.attempts, "next_run_at": job.next_run_at}
+
+@app.post("/jobs/requeue-ready")
+def requeue_ready_jobs(limit: int = 50, db: Session = Depends(get_db)):
+    now = datetime.utcnow()
+    rows = (
+        db.query(JobModel)
+        .filter(JobModel.status == "queued")
+        .filter((JobModel.next_run_at == None) | (JobModel.next_run_at <= now))
+        .order_by(JobModel.priority.desc(), JobModel.created_at.asc())
+        .limit(limit)
+        .all()
+    )
+
+    pushed = 0
+    for job in rows:
+        # Push to Redis. (Duplicate pushes are possible; we’ll guard in /start)
+        rdb.rpush(QUEUE_KEY, job.id)
+        pushed += 1
+
+    return {"requeued": pushed}
