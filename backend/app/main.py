@@ -12,6 +12,10 @@ from fastapi import Depends, HTTPException
 from app.db.database import Base, SessionLocal, engine
 from app.db.models import Job as JobModel  # noqa: E402 - register model with Base
 from datetime import timedelta
+from sqlalchemy import Boolean
+
+locked_by = Column(String, nullable=True)
+lock_expires_at = Column(DateTime, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
@@ -138,6 +142,9 @@ def start_job(job_id: str, db: Session = Depends(get_db)):
     if job.next_run_at is not None and job.next_run_at > now:
         raise HTTPException(status_code=409, detail="Job not ready to run yet")
 
+    if not job.locked_by or not job.lock_expires_at or job.lock_expires_at <= now:
+        raise HTTPException(status_code=409, detail="Job has no valid lease")
+
     job.status = "running"
     job.started_at = datetime.utcnow()
     job.next_run_at = None
@@ -158,6 +165,8 @@ def complete_job(job_id: str, db: Session = Depends(get_db)):
 
     job.status = "completed"
     job.completed_at = datetime.utcnow()
+    job.locked_by = None
+    job.lock_expires_at = None
     job.touch()
     db.commit()
 
@@ -188,6 +197,8 @@ def fail_job(job_id: str, req: FailJobRequest, db: Session = Depends(get_db)):
     delay = backoff_seconds(job.attempts)
     job.status = "queued"
     job.next_run_at = datetime.utcnow() + timedelta(seconds=delay)
+    job.locked_by = None
+    job.lock_expires_at = None
     job.touch()
     db.commit()
 
@@ -212,3 +223,37 @@ def requeue_ready_jobs(limit: int = 50, db: Session = Depends(get_db)):
         pushed += 1
 
     return {"requeued": pushed}
+
+class LeaseJobRequest(BaseModel):
+    worker_id: str = Field(..., min_length=1)
+    lease_seconds: int = Field(30, ge=5, le=300)  # lease between 5s and 5min
+
+@app.post("/jobs/{job_id}/lease")
+def lease_job(job_id: str, req: LeaseJobRequest, db: Session = Depends(get_db)):
+    job = db.query(JobModel).filter(JobModel.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # Only allow leasing queued jobs that are ready
+    now = datetime.utcnow()
+    if job.status != "queued":
+        raise HTTPException(status_code=409, detail=f"Job not leaseable (status={job.status})")
+
+    if job.next_run_at is not None and job.next_run_at > now:
+        raise HTTPException(status_code=409, detail="Job not ready yet")
+
+    # If locked and not expired, deny
+    if job.lock_expires_at is not None and job.lock_expires_at > now and job.locked_by:
+        raise HTTPException(status_code=409, detail=f"Job already leased by {job.locked_by}")
+
+    # Grant lease
+    job.locked_by = req.worker_id
+    job.lock_expires_at = now + timedelta(seconds=req.lease_seconds)
+    job.touch()
+    db.commit()
+
+    return {
+        "id": job.id,
+        "locked_by": job.locked_by,
+        "lock_expires_at": job.lock_expires_at
+    }
