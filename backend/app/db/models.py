@@ -24,5 +24,9 @@ class Job(Base):
     completed_at = Column(DateTime, nullable=True)
     next_run_at = Column(DateTime, nullable=True)
 
+    # distributed lock / leasing fields
+    locked_by = Column(String, nullable=True)
+    lock_expires_at = Column(DateTime, nullable=True)
+
     def touch(self):
         self.updated_at = datetime.utcnow()

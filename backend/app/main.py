@@ -12,10 +12,6 @@ from fastapi import Depends, HTTPException
 from app.db.database import Base, SessionLocal, engine
 from app.db.models import Job as JobModel  # noqa: E402 - register model with Base
 from datetime import timedelta
-from sqlalchemy import Boolean
-
-locked_by = Column(String, nullable=True)
-lock_expires_at = Column(DateTime, nullable=True)
 
 Base.metadata.create_all(bind=engine)
 
