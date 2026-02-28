@@ -8,10 +8,18 @@ from uuid import uuid4
 from datetime import datetime
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import asc, desc
+from sqlalchemy.sql import nullslast
 from fastapi import Depends, HTTPException
 from app.db.database import Base, SessionLocal, engine
 from app.db.models import Job as JobModel  # noqa: E402 - register model with Base
 from datetime import timedelta
+from app.ml.predict import load_model, predict_runtime_ms
+
+try:
+    ML_MODEL = load_model()
+except Exception:
+    ML_MODEL = None
 
 Base.metadata.create_all(bind=engine)
 
@@ -62,6 +70,18 @@ def create_job(req: CreateJobRequest, db: Session = Depends(get_db)):
 
     payload_str = json.dumps(req.payload) if req.payload is not None else None
 
+    pred_ms = None
+    try:
+        pred_ms = predict_runtime_ms(
+            ML_MODEL,
+            req.type,
+            req.priority,
+            0,  # new job, no attempts yet
+            payload_str,
+        )
+    except Exception:
+        pass
+
     job_row = JobModel(
         id=job_id,
         type=req.type,
@@ -72,6 +92,8 @@ def create_job(req: CreateJobRequest, db: Session = Depends(get_db)):
         max_attempts=req.max_attempts,
         last_error=None,
     )
+    if pred_ms is not None:
+        job_row.predicted_runtime_ms = pred_ms
 
     db.add(job_row)
     db.commit()
@@ -93,6 +115,8 @@ def create_job(req: CreateJobRequest, db: Session = Depends(get_db)):
         "updated_at": job_row.updated_at,
         "started_at": job_row.started_at,
         "completed_at": job_row.completed_at,
+        "runtime_ms": getattr(job_row, "runtime_ms", None),
+        "predicted_runtime_ms": getattr(job_row, "predicted_runtime_ms", None),
     }
 
 @app.get("/jobs")
@@ -121,6 +145,8 @@ def list_jobs(db: Session = Depends(get_db)):
             "updated_at": r.updated_at,
             "started_at": r.started_at,
             "completed_at": r.completed_at,
+            "runtime_ms": getattr(r, "runtime_ms", None),
+            "predicted_runtime_ms": getattr(r, "predicted_runtime_ms", None),
         })
 
     return result
@@ -325,3 +351,45 @@ def crash_job(job_id: str, db: Session = Depends(get_db)):
     job.touch()
     db.commit()
     return {"id": job.id, "status": job.status}
+
+class TelemetryRequest(BaseModel):
+    runtime_ms: int = Field(..., ge=0)
+    note: Optional[str] = None
+
+@app.post("/jobs/{job_id}/telemetry")
+def job_telemetry(job_id: str, req: TelemetryRequest, db: Session = Depends(get_db)):
+    job = db.query(JobModel).filter(JobModel.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job.runtime_ms = req.runtime_ms
+    job.touch()
+    db.commit()
+
+    return {"id": job.id, "runtime_ms": job.runtime_ms}
+
+@app.post("/ml/train")
+def train_model():
+    from app.ml.train import train
+    train()
+    global ML_MODEL
+    ML_MODEL = load_model()
+    return {"status": "trained"}
+
+@app.get("/metrics/runtime")
+def runtime_metrics(db: Session = Depends(get_db)):
+    rows = db.query(JobModel).filter(JobModel.status == "completed").filter(JobModel.runtime_ms != None).all()
+    if not rows:
+        return {"count": 0}
+
+    runtimes = [r.runtime_ms for r in rows if r.runtime_ms is not None]
+    avg = sum(runtimes) / len(runtimes)
+
+    by_type = {}
+    for r in rows:
+        by_type.setdefault(r.type, []).append(r.runtime_ms)
+
+    by_type_avg = {t: (sum(v)/len(v)) for t, v in by_type.items()}
+
+    return {"count": len(runtimes), "avg_runtime_ms": avg, "avg_by_type": by_type_avg}
+

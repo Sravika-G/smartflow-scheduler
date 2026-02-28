@@ -21,16 +21,43 @@ def safe_post(url: str, **kwargs):
         print(f"[worker] POST {url} failed: {exc}", flush=True)
         return None
 
+def safe_get(url: str, **kwargs):
+    try:
+        kwargs.setdefault("timeout", 5)
+        return requests.get(url, **kwargs)
+    except Exception as exc:
+        print(f"[worker] GET {url} failed: {exc}", flush=True)
+        return None
+
+def reconcile():
+    resp = safe_post(f"{API}/system/reconcile")
+    if resp is None:
+        return
+    if resp.status_code != 200:
+        print(f"[worker] reconcile failed: {resp.status_code} {resp.text}", flush=True)
 
 def main():
     print("Worker started. Watching for queued jobs...", flush=True)
 
     while True:
         try:
-            jobs = requests.get(f"{API}/jobs", timeout=5).json()
-            queued = [j for j in jobs if j["status"] == "queued"]
+            resp = safe_get(f"{API}/jobs")
+            if resp is None:
+                print("[worker] Could not fetch jobs", flush=True)
+                time.sleep(2)
+                continue
+
+            try:
+                jobs = resp.json()
+            except Exception as exc:
+                print(f"[worker] Invalid /jobs response: {exc}", flush=True)
+                time.sleep(2)
+                continue
+
+            queued = [j for j in jobs if j.get("status") == "queued"]
 
             if not queued:
+                reconcile()
                 time.sleep(2)
                 continue
 
@@ -54,6 +81,10 @@ def main():
                 continue
 
             print(f"Running job {job_id} (type={job['type']})", flush=True)
+            
+            # START TIMER HERE
+            start_time = time.time()
+          
             time.sleep(3)
 
             # simulate work
@@ -62,10 +93,26 @@ def main():
             # fail some jobs intentionally
             should_fail = random.random() < 0.3  # 30% failure rate
             if should_fail:
+                runtime_ms = int((time.time() - start_time) * 1000)
+                safe_post(
+                    f"{API}/jobs/{job_id}/telemetry",
+                    json={"runtime_ms": runtime_ms, "note": "failed-run"}
+                )
+
                 err = "Simulated failure during execution"
                 requests.post(f"{API}/jobs/{job_id}/fail", json={"error": err}, timeout=5)
                 print(f"Failed job {job_id} (will retry if attempts left)", flush=True)
+                
+                reconcile()
                 continue
+
+            runtime_ms = int((time.time() - start_time) * 1000)
+
+            safe_post(
+                f"{API}/jobs/{job_id}/telemetry",
+                json={"runtime_ms": runtime_ms, "note": "success-run"}
+            )
+
 
             # mark job as completed
             r = requests.post(f"{API}/jobs/{job_id}/complete", timeout=5)
@@ -74,8 +121,7 @@ def main():
             else:
                 print(f"Could not complete job {job_id}: {r.text}", flush=True)
 
-            # requeue any jobs whose next_run_at has passed
-            requests.post(f"{API}/jobs/requeue-ready", timeout=5)
+            reconcile()
 
         except Exception as e:
             print("Worker error:", e, flush=True)
