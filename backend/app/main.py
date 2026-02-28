@@ -253,3 +253,75 @@ def lease_job(job_id: str, req: LeaseJobRequest, db: Session = Depends(get_db)):
         "locked_by": job.locked_by,
         "lock_expires_at": job.lock_expires_at
     }
+
+@app.post("/system/reconcile")
+def reconcile(limit: int = 50, db: Session = Depends(get_db)):
+    now = datetime.utcnow()
+    recovered = 0
+    requeued = 0
+    deaded = 0
+
+    # 1) Recover jobs that are "running" but lease expired (worker died)
+    stuck = (
+        db.query(JobModel)
+        .filter(JobModel.status == "running")
+        .filter(JobModel.lock_expires_at != None)
+        .filter(JobModel.lock_expires_at <= now)
+        .limit(limit)
+        .all()
+    )
+
+    for job in stuck:
+        # count this as a failure attempt because worker died mid-run
+        job.attempts += 1
+        job.last_error = "Worker lease expired (worker likely crashed)"
+
+        # clear lock
+        job.locked_by = None
+        job.lock_expires_at = None
+
+        if job.attempts >= job.max_attempts:
+            job.status = "dead"
+            deaded += 1
+        else:
+            delay = backoff_seconds(job.attempts)
+            job.status = "queued"
+            job.next_run_at = now + timedelta(seconds=delay)
+            recovered += 1
+
+        job.touch()
+
+    db.commit()
+
+    # 2) Requeue ready queued jobs into Redis
+    ready = (
+        db.query(JobModel)
+        .filter(JobModel.status == "queued")
+        .filter((JobModel.next_run_at == None) | (JobModel.next_run_at <= now))
+        .order_by(JobModel.priority.desc(), JobModel.created_at.asc())
+        .limit(limit)
+        .all()
+    )
+
+    for job in ready:
+        rdb.rpush(QUEUE_KEY, job.id)
+        requeued += 1
+
+    return {
+        "recovered_running": recovered,
+        "deaded": deaded,
+        "requeued": requeued
+    }
+
+@app.post("/jobs/{job_id}/crash")
+def crash_job(job_id: str, db: Session = Depends(get_db)):
+    job = db.query(JobModel).filter(JobModel.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    # simulate worker died: keep status running, but don't complete it
+    job.status = "running"
+    job.started_at = datetime.utcnow()
+    job.touch()
+    db.commit()
+    return {"id": job.id, "status": job.status}
