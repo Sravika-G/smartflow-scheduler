@@ -11,17 +11,23 @@ from sqlalchemy.orm import Session
 from sqlalchemy import asc, desc
 from sqlalchemy.sql import nullslast
 from fastapi import Depends, HTTPException
+from sqlalchemy.exc import OperationalError
 from app.db.database import Base, SessionLocal, engine
 from app.db.models import Job as JobModel  # noqa: E402 - register model with Base
 from datetime import timedelta
 from app.ml.predict import load_model, predict_runtime_ms
+from fastapi.middleware.cors import CORSMiddleware
 
 try:
     ML_MODEL = load_model()
 except Exception:
     ML_MODEL = None
 
-Base.metadata.create_all(bind=engine)
+try:
+    Base.metadata.create_all(bind=engine)
+except OperationalError as e:
+    import sys
+    print(f"Warning: Could not connect to database (tables not created). Start Postgres and restart the app. {e}", file=sys.stderr)
 
 def get_db():
     db = SessionLocal()
@@ -47,6 +53,13 @@ def backoff_seconds(attempt: int) -> int:
     return 300
 
 app = FastAPI(title="SmartFlow Scheduler")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 rdb = redis.from_url(REDIS_URL, decode_responses=True)
@@ -382,14 +395,20 @@ def runtime_metrics(db: Session = Depends(get_db)):
     if not rows:
         return {"count": 0}
 
+    # Guard against any rows that may still have null runtime_ms
     runtimes = [r.runtime_ms for r in rows if r.runtime_ms is not None]
+    if not runtimes:
+        return {"count": 0}
+
     avg = sum(runtimes) / len(runtimes)
 
-    by_type = {}
+    by_type: dict[str, list[int]] = {}
     for r in rows:
+        if r.runtime_ms is None:
+            continue
         by_type.setdefault(r.type, []).append(r.runtime_ms)
 
-    by_type_avg = {t: (sum(v)/len(v)) for t, v in by_type.items()}
+    by_type_avg = {t: (sum(v) / len(v)) for t, v in by_type.items()} if by_type else {}
 
     return {"count": len(runtimes), "avg_runtime_ms": avg, "avg_by_type": by_type_avg}
 

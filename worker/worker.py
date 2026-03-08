@@ -74,9 +74,9 @@ def main():
                 continue
 
             # start
-            r = requests.post(f"{API}/jobs/{job_id}/start", timeout=5)
-            if r.status_code != 200:
-                print(f"Could not start job {job_id}: {r.text}", flush=True)
+            r = safe_post(f"{API}/jobs/{job_id}/start")
+            if r is None or r.status_code != 200:
+                print(f"Could not start job {job_id}: {r.text if r else 'no response'}", flush=True)
                 time.sleep(1)
                 continue
 
@@ -100,7 +100,7 @@ def main():
                 )
 
                 err = "Simulated failure during execution"
-                requests.post(f"{API}/jobs/{job_id}/fail", json={"error": err}, timeout=5)
+                safe_post(f"{API}/jobs/{job_id}/fail", json={"error": err})
                 print(f"Failed job {job_id} (will retry if attempts left)", flush=True)
                 
                 reconcile()
@@ -115,11 +115,11 @@ def main():
 
 
             # mark job as completed
-            r = requests.post(f"{API}/jobs/{job_id}/complete", timeout=5)
-            if r.status_code == 200:
+            r = safe_post(f"{API}/jobs/{job_id}/complete")
+            if r is not None and r.status_code == 200:
                 print(f"Completed job {job_id}", flush=True)
             else:
-                print(f"Could not complete job {job_id}: {r.text}", flush=True)
+                print(f"Could not complete job {job_id}: {r.text if r else 'no response'}", flush=True)
 
             reconcile()
 

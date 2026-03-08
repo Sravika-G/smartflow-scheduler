@@ -24,6 +24,9 @@ class Job(Base):
     completed_at = Column(DateTime, nullable=True)
     next_run_at = Column(DateTime, nullable=True)
 
+    runtime_ms = Column(Integer, nullable=True)
+    predicted_runtime_ms = Column(Integer, nullable=True)
+
     # distributed lock / leasing fields
     locked_by = Column(String, nullable=True)
     lock_expires_at = Column(DateTime, nullable=True)
